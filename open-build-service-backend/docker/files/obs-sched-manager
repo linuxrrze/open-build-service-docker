@@ -1,0 +1,216 @@
+#!/usr/bin/perl
+#
+# Keep the running schedulers (bs_sched <arch>) in line with OBS's
+# "Architecture Availability" (Admin > Architectures in the web UI).
+#
+# The UI stores availability in the database and immediately writes it to the
+# backend as <schedulers><arch>... in /srv/obs/configuration.xml
+# (Webui::ArchitecturesController -> Configuration.write_to_backend). Every
+# 30 seconds this daemon compares that list with the running schedulers (no
+# change detection, so quick successive UI changes can't be missed) and:
+#   * starts `bs_sched <arch>` for every listed arch that isn't running --
+#     also one that crashed, with backoff (30 s, doubling up to 30 min) while
+#     it keeps dying shortly after start
+#   * stops every running scheduler whose arch is no longer listed --
+#     including the i586 / x86_64 ones upstream's start_development_backend
+#     always starts -- by sending it the same "exitcomplete" event that
+#     `bs_sched --stop` sends (it saves its state and exits, usually within
+#     seconds). Stops never block this daemon: a scheduler still in its
+#     initial startup (a cold start can take minutes) consumes but IGNORES
+#     exit events (BSSched::EventQueue), so the event is re-sent every
+#     interval until it exits; after 15 minutes it gets SIGTERM (no state
+#     save -- it will cold-start next time).
+# The leftover lock file of a disabled, stopped scheduler is removed, so the
+# repserver no longer reports it ("dead" on the monitor).
+# A running scheduler is detected by its lock (rundir/bs_sched.<arch>.lock),
+# like bs_sched itself does. If configuration.xml doesn't exist yet (the
+# frontend writes it on start), nothing is changed.
+#
+# Usage (from start_prod_backend, as root; bs_sched drops to obsrun itself):
+#   obs-sched-manager <obs source dir> [<log dir>]
+#
+# Upstream touch points (checked at image build, see the Dockerfile):
+# bs_sched --stop, rundir/bs_sched.<arch>.lock, BSXML::configuration
+# <schedulers>, BSCando::knownarch.
+
+BEGIN { unshift @INC, '/obs/src/backend/build', '/obs/src/backend'; }
+
+use strict;
+use POSIX ();
+use BSConfiguration;
+use BSUtil;
+use BSXML;
+use BSCando;
+use BSSched::EventSource::Directory;
+
+my ($obs, $logdir) = @ARGV;
+$obs ||= '/obs';
+my $bs_sched = "$obs/src/backend/bs_sched";
+my $conf     = "$BSConfig::bsdir/configuration.xml";
+my $interval = 30;
+my $stop_timeout = 15 * 60;
+my %stopping;    # arch => { since => time, pid => pid at stop start }
+my %starts;      # arch => { last => time of last start, fails => consecutive quick deaths }
+my $lastreport = '';
+my $lastmissing = 0;
+
+$| = 1;
+
+sub logmsg { print "obs-sched-manager: @_\n"; }
+
+sub running {
+  my ($arch) = @_;
+  my $lock = "$BSConfig::rundir/bs_sched.$arch.lock";
+  return -e $lock && !BSUtil::lockcheck('>>', $lock);
+}
+
+sub start_sched {
+  my ($arch) = @_;
+  my $pid = fork();
+  return logmsg("fork failed for $arch: $!") unless defined $pid;
+  if ($pid == 0) {
+    # Double fork: the scheduler must not stay our child (no zombies, and it
+    # keeps running if this manager is restarted).
+    POSIX::setsid();
+    exit(0) if fork();
+    if ($logdir) {
+      open(STDOUT, '>>', "$logdir/bs_sched_$arch.log") || die("$logdir/bs_sched_$arch.log: $!\n");
+      open(STDERR, '>&', \*STDOUT);
+    }
+    exec($bs_sched, $arch) || die("exec $bs_sched: $!\n");
+  }
+  waitpid($pid, 0);
+  $starts{$arch}->{'last'} = time();
+  logmsg("started scheduler for $arch");
+}
+
+# Restart backoff: a scheduler that dies within 5 minutes of its start counts
+# as a quick death; wait 30 s * 2^deaths (max 30 min) before the next start.
+sub may_start {
+  my ($arch) = @_;
+  my $st = $starts{$arch} or return 1;
+  my $up = time() - $st->{'last'};
+  if ($up < 300 || $st->{'noted'}) {
+    unless ($st->{'noted'}) {    # first pass after this death
+      $st->{'fails'} = ($st->{'fails'} || 0) + 1;
+      $st->{'noted'} = time();
+      my $delay = 30 * 2 ** ($st->{'fails'} - 1);
+      $delay = 1800 if $delay > 1800;
+      $st->{'delay'} = $delay;
+      logmsg("scheduler for $arch died ${up}s after start, next start in ${delay}s (see bs_sched_$arch.log)");
+      return 0;
+    }
+    return 0 if time() - $st->{'noted'} < $st->{'delay'};
+  } else {
+    $st->{'fails'} = 0;    # it ran long enough: a later death starts fresh
+  }
+  delete $st->{'noted'};
+  return 1;
+}
+
+sub sched_pid {
+  my ($arch) = @_;
+  # the scheduler's command line is "perl <...>/bs_sched <arch>"
+  for my $p (grep { /^\d+$/ } ls('/proc')) {
+    my $cmd = readstr("/proc/$p/cmdline", 1) || '';
+    my @a = split("\0", $cmd);
+    return $p if @a >= 2 && $a[-1] eq $arch && $a[-2] =~ m{/bs_sched$};
+  }
+  return undef;
+}
+
+sub send_exit {
+  my ($arch) = @_;
+  BSSched::EventSource::Directory::sendevent({ 'eventdir' => "$BSConfig::bsdir/events" },
+    { 'type' => 'exitcomplete' }, $arch, 'exitcomplete::');
+}
+
+sub stop_sched {
+  my ($arch) = @_;
+  return if $stopping{$arch};
+  logmsg("stopping scheduler for $arch (not in Architecture Availability)");
+  $stopping{$arch} = { 'since' => time(), 'pid' => sched_pid($arch) };
+  delete $starts{$arch};    # a deliberate stop is not a crash
+  send_exit($arch);
+}
+
+# Called every interval: finish, re-send or force pending stops.
+sub progress_stops {
+  for my $arch (sort keys %stopping) {
+    if (!running($arch)) {
+      logmsg("scheduler for $arch stopped");
+      delete $stopping{$arch};
+      next;
+    }
+    my $age = time() - $stopping{$arch}->{'since'};
+    if ($age >= $stop_timeout) {
+      my $pid = sched_pid($arch) || $stopping{$arch}->{'pid'};
+      logmsg("scheduler for $arch ignored exit for ${age}s, sending SIGTERM" . ($pid ? " to $pid" : ' (pid not found)'));
+      kill('TERM', $pid) if $pid;
+      $stopping{$arch}->{'since'} = time() - $stop_timeout + $interval * 2;    # retry TERM later if needed
+      next;
+    }
+    # event consumed but scheduler still running (ignored during startup)
+    send_exit($arch) unless -e "$BSConfig::bsdir/events/$arch/exitcomplete::";
+  }
+}
+
+sub wanted {
+  my $xml = readxml($conf, $BSXML::configuration, 1);
+  return undef unless $xml;
+  my @archs = @{($xml->{'schedulers'} || {})->{'arch'} || []};
+  my %want;
+  for my $arch (@archs) {
+    if ($BSCando::knownarch{$arch}) {
+      $want{$arch} = 1;
+    } else {
+      logmsg("ignoring unknown architecture '$arch'");
+    }
+  }
+  return \%want;
+}
+
+sub reconcile {
+  my $want = wanted();
+  unless ($want) {
+    logmsg("$conf missing or unreadable -- leaving schedulers as they are") unless $lastmissing;
+    $lastmissing = 1;
+    return;
+  }
+  $lastmissing = 0;
+  my $started;
+  for my $arch (sort keys %BSCando::knownarch) {
+    my $run = running($arch);
+    if ($want->{$arch}) {
+      if ($stopping{$arch}) {
+        # re-enabled while stopping: let it finish, the next pass restarts it
+        next;
+      }
+      if (!$run && may_start($arch)) {
+        start_sched($arch);
+        $started = 1;
+      }
+    } elsif ($run) {
+      stop_sched($arch);
+    } elsif (!$stopping{$arch} && -e "$BSConfig::rundir/bs_sched.$arch.lock") {
+      # The repserver reports a scheduler for every bs_sched.<arch>.lock --
+      # also a stopped one (as "dead" on the monitor). Remove it for disabled
+      # archs; bs_sched recreates it when it starts.
+      unlink("$BSConfig::rundir/bs_sched.$arch.lock");
+      logmsg("removed lock file of disabled scheduler $arch");
+    }
+  }
+  sleep(3) if $started;    # let new schedulers take their lock before reporting
+  my $report = join(' ', grep { running($_) } sort keys %BSCando::knownarch) || 'none';
+  logmsg("schedulers: $report") if $report ne $lastreport;
+  $lastreport = $report;
+}
+
+# Give upstream's start script time to bring up srcserver/repserver and its
+# own schedulers first.
+sleep(15);
+while (1) {
+  progress_stops();
+  reconcile();
+  sleep($interval);
+}

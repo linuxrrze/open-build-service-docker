@@ -1,0 +1,271 @@
+# Self-contained OBS stack. The frontend/backend images BAKE the pinned
+# open-build-service release in at build time (see the image READMEs), so
+# NOTHING here bind-mounts a git checkout -- the only host paths are the
+# *data* mounts (fs/backend/srv/obs, fs/mariadb, fs/logs). The frontend runs
+# under RAILS_ENV=production (assets precompiled in the image; secrets and
+# hostnames come from .env via env_file).
+#
+# The frontend/backend image location comes from OBS_IMAGE_PREFIX in .env
+# (ghcr.io/<owner>, lowercase -- where this repo's GitHub Actions push them).
+services:
+
+  cache:
+    # Not built/mirrored -- unmodified upstream image, no local customization.
+    # 2.10 line (not "unstable") to match the backend/frontend images.
+    image: registry.opensuse.org/obs/server/2.10/containers/containers/openbuildservice/memcached:210
+    container_name: obs-cache
+    env_file: .env
+    command: /usr/bin/memcached -u memcached
+    restart: no
+
+  backend:
+    # Bakes the pinned OBS backend source (src/backend + contrib) into its
+    # /obs, so it no longer needs a host checkout. start_prod_backend seeds
+    # /obs/src/backend/BSConfig.pm from its .template on first run.
+    image: ${OBS_IMAGE_PREFIX:?set OBS_IMAGE_PREFIX in .env}/open-build-service-backend:latest
+    container_name: obs-backend
+    env_file: .env
+    volumes:
+      - ./fs/backend/srv/obs:/srv/obs:Z
+      - ./fs/logs:/logs
+    command: /obs/contrib/start_prod_backend -d /obs -h backend -l /logs
+    restart: no
+    depends_on:
+      obs-mariadb:
+        condition: service_healthy
+
+  worker:
+    # Same image as backend, different command (its baked /obs is independent
+    # of the backend container's). obs-entry seeds BSConfig.pm (hostname =
+    # backend) automatically, so this just runs the worker. privileged: true
+    # is required for the worker to run builds in chroot containers.
+    image: ${OBS_IMAGE_PREFIX:?set OBS_IMAGE_PREFIX in .env}/open-build-service-backend:latest
+    container_name: obs-worker
+    env_file: .env
+    volumes:
+      - ./fs/logs:/logs
+    privileged: true
+    depends_on:
+      backend:
+        condition: service_started
+    command: /obs/contrib/start_development_worker -h backend -l /logs
+    restart: no
+
+  frontend:
+    # Bakes the pinned OBS frontend (Rails API) into /obs/src/api with
+    # RAILS_ENV=production + precompiled assets. Runs the migrations on start
+    # (idempotent) then foreman (web + delayed_job + clock + search).
+    image: ${OBS_IMAGE_PREFIX:?set OBS_IMAGE_PREFIX in .env}/open-build-service-frontend:latest
+    container_name: obs-frontend
+    restart: no
+    env_file: .env
+    command:
+      - bash
+      - -c
+      - |
+        set -e
+        rm -f tmp/pids/*.pid
+        # OBS uses the data_migrate gem: schema and data migrations are separate
+        # tracks, and schema migration 20170306084558 refuses to run until its
+        # paired data migration 20170306084550 is recorded. Running plain
+        # `db:migrate` then `data:migrate` separately hits that guard, so use the
+        # combined task, which runs both in version order.
+        RAILS_ENV=production bin/rails db:migrate:with_data
+        # Write the instance configuration (name, scheduler architectures
+        # from the UI's Architecture Availability, ...) to the backend's
+        # configuration.xml -- OBS
+        # itself only does that when an admin saves the configuration page.
+        RAILS_ENV=production bin/rails runner script/obs_sync_configuration.rb \
+          || echo "WARNING: could not write configuration.xml to the backend"
+        exec foreman start -f Procfile -p 3000
+    labels:
+      - "traefik.enable=true"
+      # The `obs` router serves the web UI on the web host. It EXCLUDES the
+      # `/_obs_api_token` PathPrefix (as well as `/download`) so the dedicated
+      # `obs-api-token` router (declared below, same host) wins for that path;
+      # without the exclusion both routers would match and traefik would pick
+      # arbitrarily (alphabetical router name), sometimes sending the token
+      # call to the UI service (port 3000) instead of the issuer (port 3001).
+      - "traefik.http.routers.obs.rule=Host(`obs.example.com`) && !PathPrefix(`/download`) && !PathPrefix(`/_obs_api_token`)"
+      - "traefik.http.routers.obs.entrypoints=https"
+      - "traefik.http.routers.obs.tls=true"
+      - "traefik.http.routers.obs.tls.certresolver=letsEncrypt"
+      - "traefik.http.routers.obs.service=obs"
+      - "traefik.http.services.obs.loadbalancer.server.port=3000"
+      # Middlewares belong on the ROUTER (a services.*.middlewares label is
+      # not a traefik option). Order matters: strip client-supplied identity
+      # headers first, then let OIDC set the authenticated ones.
+      - "traefik.http.routers.obs.middlewares=obs-strip-identity@docker,obs-oidc@docker"
+
+      ## - Identity-header stripping. OBS runs in proxy-auth mode and trusts
+      ##   X-username/X-email/X-firstname/X-lastname blindly. traefikoidc
+      ##   overwrites them, but deliberately SKIPS a header whose claim renders
+      ##   empty (e.g. a user without an email claim) -- a client-sent value
+      ##   would then pass through. basicauth sets only X-username. So every
+      ##   router to OBS or the token issuer removes all four first (an empty
+      ##   customrequestheaders value deletes the header).
+      - "traefik.http.middlewares.obs-strip-identity.headers.customrequestheaders.X-username="
+      - "traefik.http.middlewares.obs-strip-identity.headers.customrequestheaders.X-email="
+      - "traefik.http.middlewares.obs-strip-identity.headers.customrequestheaders.X-firstname="
+      - "traefik.http.middlewares.obs-strip-identity.headers.customrequestheaders.X-lastname="
+      ## - Shared secret for the token issuer (frontend-token): only requests
+      ##   that went through traefik carry it, so other containers on the
+      ##   docker network can't call the issuer with a forged X-username.
+      - "traefik.http.middlewares.obs-token-issuer.headers.customrequestheaders.X-Obs-Issuer-Secret=${OBS_API_TOKEN_ISSUER_SECRET}"
+
+      ## - OIDC auth -- set OBS_OIDC_* in .env (see .env.sample). Generate
+      ##   your own clientID/clientSecret with your IdP and your own
+      ##   sessionEncryptionKey, never reuse the placeholders.
+      ##   s. https://github.com/lukaszraczylo/traefikoidc
+      - "traefik.http.middlewares.obs-oidc.plugin.traefikoidc.clientID=${OBS_OIDC_CLIENT_ID}"
+      - "traefik.http.middlewares.obs-oidc.plugin.traefikoidc.clientSecret=${OBS_OIDC_CLIENT_SECRET}"
+      - "traefik.http.middlewares.obs-oidc.plugin.traefikoidc.providerURL=${OBS_OIDC_PROVIDER_URL}"
+      - "traefik.http.middlewares.obs-oidc.plugin.traefikoidc.callbackURL=/oauth2/callback"
+      - "traefik.http.middlewares.obs-oidc.plugin.traefikoidc.logoutURL=/oauth2/logout"
+      - "traefik.http.middlewares.obs-oidc.plugin.traefikoidc.sessionEncryptionKey=${OBS_OIDC_SESSION_KEY}"
+      - "traefik.http.middlewares.obs-oidc.plugin.traefikoidc.headers[0].name=X-username"
+      - "traefik.http.middlewares.obs-oidc.plugin.traefikoidc.headers[0].value={{.Claims.preferred_username}}"
+      - "traefik.http.middlewares.obs-oidc.plugin.traefikoidc.headers[1].name=X-email"
+      - "traefik.http.middlewares.obs-oidc.plugin.traefikoidc.headers[1].value={{.Claims.email}}"
+      - "traefik.http.middlewares.obs-oidc.plugin.traefikoidc.headers[2].name=X-firstname"
+      - "traefik.http.middlewares.obs-oidc.plugin.traefikoidc.headers[2].value={{.Claims.given_name}}"
+      - "traefik.http.middlewares.obs-oidc.plugin.traefikoidc.headers[3].name=X-lastname"
+      - "traefik.http.middlewares.obs-oidc.plugin.traefikoidc.headers[3].value={{.Claims.family_name}}"
+
+      # Separate API host, protected by HTTP basic auth instead of OIDC.
+      # OBS itself stays in proxy mode: traefik validates user:password here,
+      # then forwards X-username:<that-user> and OBS attributes the call to
+      # them (the headerField below). So this is per-user passwords for API
+      # access, not a bearer/API-key token -- OBS has no native token auth.
+      #
+      # Users live in a shared htpasswd FILE (basicauth.usersFile), not an
+      # inline list, so that the self-service token issuer (the `frontend-token`
+      # service below) can add / remove entries at runtime and traefik picks
+      # them up on its file watch -- no traefik restart per user. The file is
+      # bind-mounted into frontend-token at /obs-htpasswd/obs-api-htpasswd, so
+      # on the host it's ./fs/api-htpasswd/obs-api-htpasswd. Two preconditions:
+      #   * the host dir ./fs/api-htpasswd must be writable by the frontend
+      #     uid (1000) -- pre-create it and chown it, since compose makes a
+      #     missing bind-mount dir root-owned; and
+      #   * users get in by self-issuing a token over the web host (see the
+      #     `frontend-token` service + obs-api-token router below), or by
+      #     hand-appending `htpasswd -nBb <user> <pass>` to the host file.
+      # The <user> MUST match that user's OBS login (their OIDC
+      # preferred_username), and they must have logged in via OIDC once so the
+      # account exists. An empty / missing file disables the API host (401s).
+      - "traefik.http.routers.obs-api.rule=Host(`obs-api.example.com`)"
+      - "traefik.http.routers.obs-api.entrypoints=https"
+      - "traefik.http.routers.obs-api.tls=true"
+      - "traefik.http.routers.obs-api.tls.certresolver=letsEncrypt"
+      - "traefik.http.routers.obs-api.service=obs-api"
+      - "traefik.http.routers.obs-api.middlewares=obs-strip-identity@docker,obs-api-auth@docker"
+      - "traefik.http.services.obs-api.loadbalancer.server.port=3000"
+      - "traefik.http.middlewares.obs-api-auth.basicauth.usersFile=./fs/api-htpasswd/obs-api-htpasswd"
+      - "traefik.http.middlewares.obs-api-auth.basicauth.headerField=X-username"
+    # A real deployment typically needs a reverse-proxy network (for
+    # Traefik or similar) -- add that back here per deployment; left out
+    # of the sample on purpose. traefik reaches the frontend over that docker
+    # network, so the port is published on localhost only (for local
+    # debugging): in proxy-auth mode OBS trusts X-username from ANY client
+    # that reaches port 3000 directly -- never expose it beyond the host.
+    ports:
+      - "127.0.0.1:3000:3000"
+    depends_on:
+      cache:
+        condition: service_started
+      backend:
+        condition: service_started
+      worker:
+        condition: service_started
+
+  # API-token issuer sidecar (see open-build-service/README.md "API access").
+  # Same image as `frontend` (the script is baked into
+  # /usr/local/bin/obs_api_token.rb), different command: a small WEBrick service
+  # on :3001 that lets a logged-in OIDC user issue / revoke their OWN
+  # HTTP Basic password. This container owns its `obs-api-token` traefik router
+  # + service (labels below) on the web host, reusing the `obs-oidc@docker`
+  # middleware declared on `frontend`, so it's reachable only by a logged-in
+  # user. The bcrypt
+  # hash is written into the shared htpasswd file that traefik's `obs-api`
+  # basicauth.usersFile watches, so a newly issued token is valid for API calls
+  # immediately -- no traefik restart. It's reachable only through the web
+  # host's OIDC middleware (identity from the injected X-username header), so a
+  # user can only ever manage their own token. The plaintext token is shown
+  # once when issued and never stored; the issuer only accepts requests that
+  # carry traefik's X-Obs-Issuer-Secret (OBS_API_TOKEN_ISSUER_SECRET in .env).
+  #
+  #   * ./fs/api-htpasswd is the SAME host dir `obs-api`'s basicauth.usersFile
+  #     reads (./fs/api-htpasswd/obs-api-htpasswd) -- the issuer writes the hash
+  #     into it there, traefik watches it, no restart needed.
+  #   * ONCE (host): pre-create the dir + an empty file, and chown the dir to
+  #     the frontend uid (1000) so the issuer can write / atomically rename
+  #     inside it:
+  #       mkdir -p fs/api-htpasswd && chown 1000:1000 fs/api-htpasswd \
+  #         && : > fs/api-htpasswd/obs-api-htpasswd
+  #     (compose would create a missing bind dir root-owned, which the frontend
+  #     user can't write; the empty file gives traefik something to read at t=0
+  #     so the API host isn't down during the boot race.)
+  frontend-token:
+    image: ${OBS_IMAGE_PREFIX:?set OBS_IMAGE_PREFIX in .env}/open-build-service-frontend:latest
+    container_name: obs-frontend-token
+    restart: no
+    command: bundle exec ruby /usr/local/bin/obs_api_token.rb
+    environment:
+      # Dedicated (made-up) mount point, so we don't hide anything the image
+      # expects at a real path. The script's default (/etc/obs/...) is
+      # overridden to this file.
+      OBS_API_TOKEN_HTPASSWD: /obs-htpasswd/obs-api-htpasswd
+      OBS_API_TOKEN_ISSUER_SECRET: ${OBS_API_TOKEN_ISSUER_SECRET}
+    volumes:
+      - ./fs/api-htpasswd:/obs-htpasswd
+    labels:
+      # This container RUNS the issuer on :3001, so it owns the `obs-api-token`
+      # router AND the `obs-api-token` service (loadbalancer port 3001 -> its
+      # own process). It's routed on the web host (obs.example.com) with the
+      # SAME OIDC middleware the UI uses (`obs-oidc@docker`, declared on the
+      # `frontend` container) -- traefik's docker provider resolves that
+      # cross-container middleware reference by name -- so a request here is,
+      # by construction, authenticated, and the X-username header carries the
+      # caller's identity (the only identity the script will issue for). The
+      # `obs` router on the UI container EXCLUDES this PathPrefix so the two
+      # routers don't both match and traefik doesn't pick arbitrarily.
+      - "traefik.enable=true"
+      - "traefik.http.routers.obs-api-token.rule=Host(`obs.example.com`) && PathPrefix(`/_obs_api_token`)"
+      - "traefik.http.routers.obs-api-token.entrypoints=https"
+      - "traefik.http.routers.obs-api-token.tls=true"
+      - "traefik.http.routers.obs-api-token.tls.certresolver=letsEncrypt"
+      - "traefik.http.routers.obs-api-token.service=obs-api-token"
+      - "traefik.http.routers.obs-api-token.middlewares=obs-strip-identity@docker,obs-oidc@docker,obs-token-issuer@docker"
+      - "traefik.http.services.obs-api-token.loadbalancer.server.port=3001"
+
+  obs-download:
+    image: nginx
+    container_name: obs-download
+    restart: no
+    volumes:
+      - /etc/localtime:/etc/localtime:ro
+      - ./fs/backend/srv/obs/repos:/usr/share/nginx/html/download
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.obs-download.rule=Host(`obs.example.com`) && PathPrefix(`/download`)"
+      - "traefik.http.routers.obs-download.entrypoints=https"
+      - "traefik.http.routers.obs-download.tls=true"
+      - "traefik.http.routers.obs-download.tls.certresolver=letsEncrypt"
+      - "traefik.http.routers.obs-download.service=obs-download"
+      - "traefik.http.services.obs-download.loadbalancer.server.port=80"
+
+  obs-mariadb:
+    image: mariadb:lts
+    container_name: obs-mariadb
+    command: '--default-authentication-plugin=mysql_native_password'
+    restart: no
+    env_file: .env
+    volumes:
+      - /etc/localtime:/etc/localtime:ro
+      - ./fs/mariadb/var/lib/mysql:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      start_period: 10s
+      interval: 10s
+      timeout: 5s
+      retries: 3

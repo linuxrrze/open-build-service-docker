@@ -1,0 +1,235 @@
+name: open-build-service-backend - check upstream image & rebuild
+# Run title in the Actions list: scheduled/manual runs would otherwise show
+# whatever commit is latest on main. Empty (push) = GitHub's default subject.
+run-name: ${{ github.event_name == 'schedule' && 'Scheduled check' || github.event_name == 'workflow_dispatch' && 'Manual run' || '' }}
+
+on:
+  schedule:
+    # daily at 06:00 UTC (frontend runs at 06:20, so their bump commits
+    # rarely race -- the record step retries anyway)
+    - cron: '0 6 * * *'
+  workflow_dispatch: {}
+  push:
+    branches: [main]
+    paths:
+      # Only what goes into the image -- not the README or
+      # .open-build-service-backend-version (CI's own bump commit would
+      # otherwise trigger a second, identical rebuild; on GitHub a push made
+      # with GITHUB_TOKEN doesn't trigger workflows anyway, but keep the
+      # filter tight so README edits don't rebuild either).
+      - open-build-service-backend/docker/**
+      - open-build-service/config/**
+      - .github/scripts/**
+      - .github/workflows/open-build-service-backend-rebuild.yml
+
+# GITHUB_TOKEN scopes: push the image to ghcr.io, commit the version bump.
+permissions:
+  contents: write
+  packages: write
+
+# Never run two builds of this image at once (a scheduled run overlapping a
+# push run would push the same tags and race on the version-bump commit).
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_MANIFEST: https://registry.opensuse.org/v2/obs/server/2.10/containers/containers/openbuildservice/backend/manifests/210
+  # build.opensuse.org's own package definition for this image's source --
+  # openSUSE pins its <param name="version"> here to the exact 2.10.x release
+  # currently built into the :210 base image. We ALSO bake that same
+  # release's source into the image (the runtime base is runtime-only), so
+  # this read serves double duty: it names the source tag to clone AND gives
+  # the image tag a human-readable version.
+  UPSTREAM_SERVICE_FILE: https://api.opensuse.org/public/source/OBS:Server:2.10/obs-server/_service
+  UPSTREAM_REPO: https://github.com/openSUSE/open-build-service.git
+  REGISTRY: ghcr.io
+  IMAGE_NAME: open-build-service-backend
+  VERSION_FILE: open-build-service-backend/.open-build-service-backend-version
+
+jobs:
+  check-and-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set image name
+        run: |
+          # ghcr.io repository names must be lowercase; the owner may not be.
+          echo "IMAGE=$REGISTRY/${GITHUB_REPOSITORY_OWNER,,}/$IMAGE_NAME" >> "$GITHUB_ENV"
+
+      - name: Determine latest upstream backend image digest
+        id: check
+        run: |
+          set -euo pipefail
+          # registry.opensuse.org answers anonymous, unauthenticated v2 API
+          # requests for this public image (no WWW-Authenticate challenge,
+          # plain 200 with a Docker-Content-Digest header) -- no token dance.
+          DIGEST=$(curl -sfD - "$UPSTREAM_MANIFEST" -o /dev/null \
+            | grep -i '^docker-content-digest:' | awk '{print $2}' | tr -d '\r')
+
+          if [ -z "$DIGEST" ]; then
+            echo "::error::could not read Docker-Content-Digest from $UPSTREAM_MANIFEST" >&2
+            exit 1
+          fi
+
+          CURRENT=$(cat "$VERSION_FILE" 2>/dev/null || echo none)
+
+          # Pull the human-readable version string openSUSE pins in their own
+          # package definition. This ALSO selects the source tag we bake into
+          # the image (the source must match what the runtime was built
+          # from), so if this read ever fails or changes format the whole
+          # build can't proceed -- fail loudly.
+          VERSION=$(curl -sf "$UPSTREAM_SERVICE_FILE" \
+            | grep -oE '<param name="version">[^<]+</param>' \
+            | sed -E 's/<[^>]+>//g')
+          if [ -z "$VERSION" ] || ! [[ "$VERSION" =~ ^[0-9]+(\.[0-9]+){1,3}$ ]]; then
+            echo "::error::could not read a valid pinned version from $UPSTREAM_SERVICE_FILE (got '${VERSION:-<empty>}') -- needed to pick the source tag to bake in" >&2
+            exit 1
+          fi
+          TAG="$VERSION"
+
+          echo "open-build-service-backend: current=$CURRENT latest=$DIGEST tag=$TAG"
+          echo "latest=$DIGEST" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          # Dated tag next to the moving version tag: a base-digest rebuild
+          # re-publishes the same :<version>, this keeps the previous build
+          # pullable for a rollback.
+          echo "datetag=$TAG-$(date -u +%Y%m%d)" >> "$GITHUB_OUTPUT"
+          if [ "$DIGEST" != "$CURRENT" ]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Build on a base-image change, and also on push / manual dispatch (so
+      # editing the Dockerfile, the helper scripts or open-build-service/config/
+      # always rebuilds) -- only the nightly cron skips when nothing upstream
+      # changed.
+      - name: Clone upstream release
+        if: github.event_name != 'schedule' || steps.check.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/open-build-service-src
+          # Pin the exact release the :210 runtime base was built from (see the
+          # check step), so the baked source matches the runtime. Shallow
+          # single-tag clone. The src/backend/build (obs-build) submodule is
+          # deliberately NOT initialized: its pin is years stale, and the
+          # Dockerfile points build/ at the base image's packaged obs-build
+          # instead, like upstream's obs-server rpm does.
+          git clone --depth 1 --branch "${{ steps.check.outputs.tag }}" \
+            "$UPSTREAM_REPO" /tmp/open-build-service-src
+
+      - name: Stage this repo's files into the build context
+        if: github.event_name != 'schedule' || steps.check.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          # The build context is the upstream clone, so stage the files our
+          # Dockerfile COPYs from paths that only exist in THIS repo:
+          #   - open-build-service/config/start_prod_backend (the backend
+          #     startup script, distinct from upstream's start_development_backend)
+          #   - open-build-service-backend/docker/files/* (the runtime
+          #     entrypoint that seeds BSConfig.pm on each start, plus the
+          #     scheduler manager and the job reaper)
+          # Upstream has no `docker/` dir at its root (only `docker-files`), so
+          # this doesn't collide with anything in the clone.
+          mkdir -p /tmp/open-build-service-src/open-build-service/config \
+                   /tmp/open-build-service-src/docker/files
+          cp open-build-service/config/start_prod_backend /tmp/open-build-service-src/open-build-service/config/start_prod_backend
+          cp open-build-service-backend/docker/files/obs-entry.sh  /tmp/open-build-service-src/docker/files/obs-entry.sh
+          cp open-build-service-backend/docker/files/obs-reap-jobs /tmp/open-build-service-src/docker/files/obs-reap-jobs
+          cp open-build-service-backend/docker/files/obs-sched-manager /tmp/open-build-service-src/docker/files/obs-sched-manager
+          # Upstream's backend test suite and its data, never used at runtime.
+          # Dropped from the build context so they never land in an image layer.
+          rm -rf /tmp/open-build-service-src/src/backend/t \
+                 /tmp/open-build-service-src/src/backend/testdata
+
+      - name: Build image
+        if: github.event_name != 'schedule' || steps.check.outputs.changed == 'true'
+        run: |
+          # Build context = the release clone (repo root) so the Dockerfile can
+          # COPY src/backend/, contrib/ and the staged start script. Our own
+          # Dockerfile (open-build-service-backend/docker/Dockerfile) -- see
+          # it for what gets baked in.
+          # The source label links the ghcr.io package to this repository
+          # (package page, and it inherits the repo's access settings).
+          docker build --pull \
+            -f open-build-service-backend/docker/Dockerfile \
+            --label "org.opencontainers.image.source=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
+            --label "org.opencontainers.image.version=${{ steps.check.outputs.tag }}" \
+            -t "$IMAGE:${{ steps.check.outputs.tag }}" \
+            -t "$IMAGE:${{ steps.check.outputs.datetag }}" \
+            -t "$IMAGE:latest" \
+            /tmp/open-build-service-src
+
+      # Startup banner (image name + version, figlet style) as a thin layer
+      # on top of the built image, same tags -- see .github/scripts/add-banner.sh.
+      - name: Add startup banner
+        if: github.event_name != 'schedule' || steps.check.outputs.changed == 'true'
+        run: |
+          bash .github/scripts/add-banner.sh \
+            "$IMAGE:${{ steps.check.outputs.tag }}" \
+            "$IMAGE:${{ steps.check.outputs.datetag }}" \
+            "$IMAGE:latest"
+
+      # Fail the publish on a fixable CRITICAL/HIGH (OS packages of the
+      # openSUSE backend base + the source-service packages we bake in).
+      # Lower severities and CVEs with no available fix are reported but
+      # don't block. To relax: drop `--exit-code 1` (report-only) or narrow
+      # `--severity`.
+      - name: Security scan (Trivy)
+        if: github.event_name != 'schedule' || steps.check.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          # Trivy's secret scanner reads each layer's raw tarball, so the dummy
+          # cloud-upload key that openSUSE's base image ships at
+          # /etc/obs/cloudupload/secret.pem is still flagged even though our
+          # Dockerfile removes it in a later layer. It's an unused placeholder
+          # (we don't configure AWS/EC2 cloud upload). --skip-files uses
+          # doublestar globs, so a nested path needs the **/ prefix; this skips
+          # only that one key (the base's other .pem files are CA bundles /
+          # container-signing certs, not private keys) and keeps the rest of the
+          # secret scan fully active.
+          bash .github/scripts/trivy-scan.sh "$IMAGE:latest" \
+            --skip-files '**/cloudupload/secret.pem'
+
+      - name: Push image
+        if: github.event_name != 'schedule' || steps.check.outputs.changed == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          printf '%s' "$GITHUB_TOKEN" | docker login "$REGISTRY" \
+            -u "$GITHUB_ACTOR" --password-stdin
+          docker push "$IMAGE:${{ steps.check.outputs.tag }}"
+          docker push "$IMAGE:${{ steps.check.outputs.datetag }}"
+          docker push "$IMAGE:latest"
+
+      - name: Record built version
+        if: github.event_name != 'schedule' || steps.check.outputs.changed == 'true'
+        run: |
+          echo "${{ steps.check.outputs.latest }}" > "$VERSION_FILE"
+          git add "$VERSION_FILE"
+          # A push-triggered rebuild with no upstream change writes identical
+          # content -- only commit/push when the tracked digest actually moved.
+          if git diff --cached --quiet; then
+            echo "no version change to record"
+            exit 0
+          fi
+          git config user.email "41898233+github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+          git commit -m "open-build-service-backend: bump tracked upstream digest to ${{ steps.check.outputs.latest }} (${{ steps.check.outputs.tag }})"
+          # The frontend workflow can push its own version-bump commit around
+          # the same time -- retry with rebase on a non-fast-forward push
+          # instead of failing outright.
+          for attempt in 1 2 3 4 5; do
+            if git push; then
+              break
+            fi
+            if [ "$attempt" = 5 ]; then
+              echo "::error::failed to push after $attempt attempts" >&2
+              exit 1
+            fi
+            sleep $((RANDOM % 5 + 1))
+            git fetch origin main
+            git rebase origin/main
+          done

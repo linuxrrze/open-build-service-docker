@@ -1,0 +1,35 @@
+#
+# ThinkingSphinx (full-text search) config, merged into the frontend image by
+# CI (open-build-service-frontend rebuild workflow).
+#
+# OBS ships only config/thinking_sphinx.yml.example -- a real thinking_sphinx.yml
+# is generated at install time and is normally absent in a container. thinking-
+# sphinx loads config/thinking_sphinx.yml (ERB + YAML, keyed by Rails.env), so
+# we provide one. The production: values match upstream's .example (searchd
+# MySQL-protocol port 9314, the bin_path/mem_limit/charset_table the searchd
+# in the Procfile's `search` process uses).
+#
+# connection_options is merged by thinking-sphinx directly into the Mysql2::Client
+# options it uses to talk to searchd over the MySQL protocol (see the gem's
+# lib/thinking_sphinx/connection.rb). searchd's MySQL-protocol listener has no
+# SSL. The base image's libmariadb3 (MariaDB Connector/C >= 3.4) verifies the
+# server certificate by default, and while verification is on it *forces* TLS
+# in the handshake (plugins/auth/my_auth.c) -- so against searchd it fails with
+# "TLS/SSL error: SSL is required, but the server does not support it", which
+# turns every Sphinx update -- e.g. Project#destroy -- into a 500.
+#
+# mysql2 0.5.2 can't switch this off itself: its ssl_mode= is a no-op on
+# libmariadb (version gate, "does not support setting ssl_mode" warning), and
+# ssl-enforce=0 / ssl=0 / skip-ssl are overridden by the verification default.
+# What works is turning off server-cert verification, which lets the client
+# fall back to plaintext when the server offers no TLS. default_file points
+# libmariadb at no_ssl.cnf (ssl-verify-server-cert=0), scoped to just this
+# connection -- the global MARIADB_TLS_DISABLE_PEER_VERIFICATION env var would
+# also drop verification on Rails' real MariaDB connection.
+production:
+  mysql41: 9314
+  bin_path: /usr/bin
+  mem_limit: 512M
+  charset_table: "0..9, a..z, A..Z->a..z, U+410..U+42F->U+430..U+44F, U+430..U+44F"
+  connection_options:
+    default_file: /obs/src/api/config/no_ssl.cnf

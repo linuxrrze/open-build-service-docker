@@ -1,0 +1,17 @@
+# Real compose files contain site-specific details (IPs, networks, hostnames,
+# secrets). open-build-service/ ships a docker-compose.yml.sample instead;
+# copy it to docker-compose.yml locally and fill in your own values.
+**/docker-compose.yml
+!**/docker-compose.yml.sample
+
+# Live bind-mount data (backend data, database, logs, htpasswd) -- never repo content.
+**/fs/
+
+# .env holds a real MariaDB password, Rails secret_key_base, OIDC credentials
+# and the token-issuer secret -- see .env.sample (the committed template).
+open-build-service/.env
+# real values migrated from an old build environment -- never tracked
+open-build-service/.env.migrated
+
+# local upstream clone while developing (CI clones it to /tmp)
+open-build-service-src/

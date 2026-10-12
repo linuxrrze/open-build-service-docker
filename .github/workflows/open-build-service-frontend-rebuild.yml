@@ -1,0 +1,279 @@
+name: open-build-service-frontend - check upstream release & rebuild
+# Run title in the Actions list: scheduled/manual runs would otherwise show
+# whatever commit is latest on main. Empty (push) = GitHub's default subject.
+run-name: ${{ github.event_name == 'schedule' && 'Scheduled check' || github.event_name == 'workflow_dispatch' && 'Manual run' || '' }}
+
+on:
+  schedule:
+    # daily at 06:20 UTC (backend runs at 06:00, so their bump commits
+    # rarely race -- the record step retries anyway)
+    - cron: '20 6 * * *'
+  workflow_dispatch: {}
+  push:
+    branches: [main]
+    paths:
+      # Only what goes into (or gates) the image -- not the README or
+      # .open-build-service-frontend-version (CI's own bump commit would
+      # otherwise trigger a second, identical rebuild).
+      - .github/workflows/open-build-service-frontend-rebuild.yml
+      - .github/scripts/**
+      - open-build-service-frontend/docker/**
+      - open-build-service-frontend/.trivyignore
+      - open-build-service/config/**
+
+# GITHUB_TOKEN scopes: push the image to ghcr.io, commit the version bump.
+permissions:
+  contents: write
+  packages: write
+
+# Never run two builds of this image at once (a scheduled run overlapping a
+# push run would push the same tags and race on the version-bump commit).
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+env:
+  # build.opensuse.org's own package definition: openSUSE pins its
+  # <param name="version"> here to the exact 2.10.x release built into the
+  # :210 runtime base. The source we bake in must be that same release, so
+  # this (not "highest git tag") picks the tag to clone -- same source of
+  # truth as the backend workflow, so both images always move together.
+  UPSTREAM_SERVICE_FILE: https://api.opensuse.org/public/source/OBS:Server:2.10/obs-server/_service
+  UPSTREAM_REPO: https://github.com/openSUSE/open-build-service.git
+  DOCKERFILE: open-build-service-frontend/docker/Dockerfile
+  REGISTRY: ghcr.io
+  IMAGE_NAME: open-build-service-frontend
+  VERSION_FILE: open-build-service-frontend/.open-build-service-frontend-version
+
+jobs:
+  check-and-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set image name
+        run: |
+          # ghcr.io repository names must be lowercase; the owner may not be.
+          echo "IMAGE=$REGISTRY/${GITHUB_REPOSITORY_OWNER,,}/$IMAGE_NAME" >> "$GITHUB_ENV"
+
+      - name: Determine pinned OBS release and base image digest
+        id: check
+        run: |
+          set -euo pipefail
+          # The pinned release (see UPSTREAM_SERVICE_FILE above). If this read
+          # ever fails or changes format the build can't pick its source tag
+          # -- fail loudly.
+          VERSION=$(curl -sf "$UPSTREAM_SERVICE_FILE" \
+            | grep -oE '<param name="version">[^<]+</param>' \
+            | sed -E 's/<[^>]+>//g')
+          if [ -z "$VERSION" ] || ! [[ "$VERSION" =~ ^[0-9]+(\.[0-9]+){1,3}$ ]]; then
+            echo "::error::could not read a valid pinned version from $UPSTREAM_SERVICE_FILE (got '${VERSION:-<empty>}')" >&2
+            exit 1
+          fi
+
+          # Also track the runtime base image's digest, so an openSUSE rebuild
+          # of the base (security fixes, same :210 tag) rebuilds this image
+          # too. The base is read from the Dockerfile's FROM line, so the
+          # tracked image can never drift from the one actually built on.
+          # registry.opensuse.org answers anonymous v2 manifest requests for
+          # these public images (no token dance, see the backend workflow).
+          BASE=$(awk '$1 == "FROM" {print $2}' "$DOCKERFILE" | tail -1)
+          BASE_REPO=${BASE%:*}; BASE_TAG=${BASE##*:}
+          MANIFEST="https://${BASE_REPO%%/*}/v2/${BASE_REPO#*/}/manifests/$BASE_TAG"
+          DIGEST=$(curl -sfD - "$MANIFEST" -o /dev/null \
+            -H 'Accept: application/vnd.docker.distribution.manifest.v2+json' \
+            | grep -i '^docker-content-digest:' | awk '{print $2}' | tr -d '\r')
+          if [ -z "$DIGEST" ]; then
+            echo "::error::could not read Docker-Content-Digest from $MANIFEST" >&2
+            exit 1
+          fi
+
+          LATEST="$VERSION@$DIGEST"
+          CURRENT=$(cat "$VERSION_FILE" 2>/dev/null || echo none)
+
+          echo "open-build-service-frontend: current=$CURRENT latest=$LATEST"
+          echo "latest=$LATEST" >> "$GITHUB_OUTPUT"
+          echo "tag=$VERSION" >> "$GITHUB_OUTPUT"
+          # Dated tag next to the moving version tag: a base-digest rebuild
+          # re-publishes the same :<version>, this keeps the previous build
+          # pullable for a rollback.
+          echo "datetag=$VERSION-$(date -u +%Y%m%d)" >> "$GITHUB_OUTPUT"
+          if [ "$LATEST" != "$CURRENT" ]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Build on a release/base change, and also on push / manual dispatch
+      # (so editing the Dockerfile or open-build-service/config/ always
+      # rebuilds) -- only the nightly cron skips when nothing upstream changed.
+      - name: Clone upstream release
+        if: github.event_name != 'schedule' || steps.check.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/open-build-service-src
+          # A real, immutable tag -- a shallow single-tag clone is safe.
+          git clone --depth 1 --branch "${{ steps.check.outputs.tag }}" \
+            "$UPSTREAM_REPO" /tmp/open-build-service-src
+          # src/api has no submodules (only src/backend/build does, which the
+          # frontend image doesn't use), so no submodule init is needed here.
+
+      - name: Merge this repo's config overrides into the app
+        if: github.event_name != 'schedule' || steps.check.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          # The image bakes the app source (no runtime checkout), so our
+          # site-specific config must be part of it. CI applies these
+          # overrides at build time. (start_prod_backend lives with the
+          # backend image; the frontend only needs the Rails config.)
+          # Keep upstream files untouched where possible -- we only ADD files,
+          # so a new release's own changes come through unmodified.
+          A=/tmp/open-build-service-src/src/api
+          cp open-build-service/config/database.yml "$A/config/database.yml"
+          # options.yml = upstream's .example + our short production: block
+          # (last duplicate key wins, upstream defaults stay upstream's).
+          cat "$A/config/options.yml.example" \
+              open-build-service/config/options.production.yml \
+            > "$A/config/options.yml"
+          # Static files, OBS_PROXY_AUTH_* env overrides, SECRET_KEY_BASE check.
+          cp open-build-service/config/zz_container.rb "$A/config/initializers/zz_container.rb"
+          # Start-time sync of .env settings into configuration.xml (run by
+          # the compose command, after the migrations).
+          cp open-build-service/config/obs_sync_configuration.rb "$A/script/obs_sync_configuration.rb"
+          # thinking-sphinx loads config/thinking_sphinx.yml; OBS ships only
+          # the .example, so provide one. Its production connection_options
+          # point the Mysql2 client that talks to searchd's (no-SSL)
+          # MySQL-protocol port at no_ssl.cnf (ssl-verify-server-cert=0) --
+          # otherwise libmariadb 3.4's verify-by-default forces TLS and every
+          # Sphinx update (e.g. Project#destroy) 500s with "SSL is required,
+          # but the server does not support it".
+          cp open-build-service/config/thinking_sphinx.yml "$A/config/thinking_sphinx.yml"
+          cp open-build-service/config/no_ssl.cnf "$A/config/no_ssl.cnf"
+          # The API-token issuer (run by the `frontend-token` compose service;
+          # see open-build-service/README.md "API access"). The build context
+          # is the clone root (not our repo), so copy it there for the
+          # Dockerfile's `COPY obs_api_token.rb` to find.
+          cp open-build-service-frontend/docker/obs_api_token.rb /tmp/open-build-service-src/obs_api_token.rb
+          # Upstream's test suites, never used at runtime (the Procfile,
+          # db:migrate and assets:precompile don't touch them). Dropped from
+          # the build context rather than `rm`ed in the Dockerfile, so they
+          # never land in any image layer: smaller image, and spec/ ships a
+          # private-key fixture (spec/fixtures/files/cloudupload_secret_key_tests.pem)
+          # Trivy's secret scanner would flag.
+          rm -rf "$A/spec" "$A/test"
+          echo "merged open-build-service/config overrides into src/api"
+
+      - name: Upstream drift guard (obs_sync_configuration.rb / zz_container.rb touch points)
+        if: github.event_name != 'schedule' || steps.check.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          # obs_sync_configuration.rb relies on these upstream internals; fail
+          # the build with a clear message if a new OBS release changes them.
+          A=/tmp/open-build-service-src/src/api
+          fail=0
+          check() { grep -qE "$2" "$A/$1" || { echo "::error::upstream drift: '$2' no longer in src/api/$1 -- review open-build-service/config/obs_sync_configuration.rb"; fail=1; }; }
+          check app/models/configuration.rb 'def write_to_backend'
+          check app/models/configuration.rb 'after_save :delayed_write_to_backend'
+          check app/views/models/_configuration.xml.builder 'Architecture\.where\(available: 1\)'
+          # zz_container.rb replaces WorkerStatus#parse_daemon_infos (keeps the
+          # queue statistics, drops upstream's availability write-back).
+          check app/models/worker_status.rb 'def parse_daemon_infos\(daemon\)'
+          check app/models/worker_status.rb 'a\.available = true'
+          # zz_container.rb makes Webui::ArchitecturesController#update toggle
+          # when the checkbox request carries no `available` (upstream page bug).
+          check app/controllers/webui/architectures_controller.rb "architecture\\.update\\(available: params\\[:available\\] == 'true'\\)"
+          check app/models/worker_status.rb "add_squeue\\(\"squeue_#\\{key\\}_#\\{arch\\}\", queue\\[key\\]\\)"
+          exit $fail
+
+      - name: Build image
+        if: github.event_name != 'schedule' || steps.check.outputs.changed == 'true'
+        run: |
+          # Build context = the release clone (repo root) so the Dockerfile can
+          # COPY src/api/ into the image. Our own Dockerfile (self-contained
+          # image) rather than upstream's -- see
+          # open-build-service-frontend/docker/Dockerfile.
+          # The source label links the ghcr.io package to this repository
+          # (package page, and it inherits the repo's access settings).
+          docker build --pull \
+            -f "$DOCKERFILE" \
+            --build-arg CONTAINER_USERID=1000 \
+            --label "org.opencontainers.image.source=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
+            --label "org.opencontainers.image.version=${{ steps.check.outputs.tag }}" \
+            -t "$IMAGE:${{ steps.check.outputs.tag }}" \
+            -t "$IMAGE:${{ steps.check.outputs.datetag }}" \
+            -t "$IMAGE:latest" \
+            /tmp/open-build-service-src
+
+      # Startup banner (image name + version, figlet style) as a thin layer
+      # on top of the built image, same tags -- see .github/scripts/add-banner.sh.
+      - name: Add startup banner
+        if: github.event_name != 'schedule' || steps.check.outputs.changed == 'true'
+        run: |
+          bash .github/scripts/add-banner.sh \
+            "$IMAGE:${{ steps.check.outputs.tag }}" \
+            "$IMAGE:${{ steps.check.outputs.datetag }}" \
+            "$IMAGE:latest"
+
+      # Fail the publish on a fixable CRITICAL/HIGH (OS packages of the
+      # upstream api Dockerfile base). Lower severities and CVEs with no
+      # available fix are reported but don't block. To relax: drop
+      # `--exit-code 1` (report-only) or narrow `--severity`.
+      - name: Security scan (Trivy)
+        if: github.event_name != 'schedule' || steps.check.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          # The baked Ruby bundle's *vulnerability* findings (gem CVEs from
+          # the pinned OBS 2.10.34 / Rails 5.2 / Ruby 2.7 stack) are accepted
+          # and documented in open-build-service-frontend/.trivyignore, passed
+          # via --ignorefile -- they're structurally unfixable without forking
+          # OBS and re-resolving the whole Gemfile.lock.
+          #
+          # Trivy's *secret* scanner separately flags dummy private keys that
+          # ship inside gem test suites (e.g. mysql2/spec/ssl/*.pem). None are
+          # real secrets. --skip-files uses doublestar globs (nested paths need
+          # the **/ prefix); **/spec/**/*.pem skips exactly the test-fixture
+          # keys under spec/ dirs and keeps the rest of the secret scan active.
+          bash .github/scripts/trivy-scan.sh "$IMAGE:latest" \
+            --ignorefile open-build-service-frontend/.trivyignore \
+            --skip-files '**/spec/**/*.pem'
+
+      - name: Push image
+        if: github.event_name != 'schedule' || steps.check.outputs.changed == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          printf '%s' "$GITHUB_TOKEN" | docker login "$REGISTRY" \
+            -u "$GITHUB_ACTOR" --password-stdin
+          docker push "$IMAGE:${{ steps.check.outputs.tag }}"
+          docker push "$IMAGE:${{ steps.check.outputs.datetag }}"
+          docker push "$IMAGE:latest"
+
+      - name: Record built version
+        if: github.event_name != 'schedule' || steps.check.outputs.changed == 'true'
+        run: |
+          echo "${{ steps.check.outputs.latest }}" > "$VERSION_FILE"
+          git add "$VERSION_FILE"
+          # A push-triggered rebuild with no upstream change writes identical
+          # content -- only commit/push when the tracked version actually moved.
+          if git diff --cached --quiet; then
+            echo "no version change to record"
+            exit 0
+          fi
+          git config user.email "41898233+github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+          git commit -m "open-build-service-frontend: bump tracked release/base to ${{ steps.check.outputs.latest }}"
+          # The backend workflow can push its own version-bump commit around
+          # the same time -- retry with rebase on a non-fast-forward push
+          # instead of failing outright.
+          for attempt in 1 2 3 4 5; do
+            if git push; then
+              break
+            fi
+            if [ "$attempt" = 5 ]; then
+              echo "::error::failed to push after $attempt attempts" >&2
+              exit 1
+            fi
+            sleep $((RANDOM % 5 + 1))
+            git fetch origin main
+            git rebase origin/main
+          done

@@ -1,0 +1,76 @@
+#!/usr/bin/perl
+#
+# Release build jobs whose worker is gone (backend only; run every 5 minutes
+# by start_prod_backend's worker sweep).
+#
+# A job stays "building" -- and the monitor keeps listing its worker as busy
+# -- until the SAME worker id reports idle again (bs_repserver workerstate:
+# "worker must have crashed, discard old job"). Workers are registered as
+# "$HOSTNAME:<n>", so a worker container that was recreated while building
+# (e.g. OBS shut down mid-build) comes back under a new id and nobody ever
+# releases its job.
+#
+# For every job in state "building" this asks the recorded worker
+# `GET <uri>/worker?jobid=<jobid>`, which succeeds only while that worker is
+# alive AND still building exactly this job (bs_worker getstate). A job that
+# fails the check on two consecutive runs (~5 min apart) is handed back with
+# upstream's own call, `POST /jobs/<arch>/<job>?cmd=idleworker` on the
+# repserver (what a restarting worker triggers) -- it only resets the job if
+# worker id and job id still match, and the dispatcher then reschedules it.
+#
+# Upstream touch points (checked at image build, see the Dockerfile):
+# BSXML::jobstatus (code/uri/jobid/workerid/hostarch), bs_worker's
+# '/worker $jobid:?' route, bs_repserver's 'cmd=idleworker workerid jobid?'.
+
+BEGIN { unshift @INC, '/obs/src/backend/build', '/obs/src/backend'; }
+
+use strict;
+use BSConfiguration;
+use BSUtil;
+use BSXML;
+use BSRPC;
+
+my $jobsdir    = "$BSConfig::bsdir/jobs";
+my $workersdir = "$BSConfig::bsdir/workers";
+my $suspects   = "$BSConfig::rundir/obs-reap-jobs.suspects";
+
+my %before = map { $_ => 1 } split("\n", readstr($suspects, 1) || '');
+my %now;
+
+for my $arch (sort(ls($jobsdir))) {
+  next unless -d "$jobsdir/$arch";
+  for my $f (sort(grep { /:status$/ } ls("$jobsdir/$arch"))) {
+    my $job = $f;
+    $job =~ s/:status$//;
+    my $js = readxml("$jobsdir/$arch/$f", $BSXML::jobstatus, 1);
+    next unless $js && ($js->{'code'} || '') eq 'building';
+    next unless $js->{'uri'} && $js->{'jobid'} && defined($js->{'workerid'});
+
+    my $alive = eval {
+      BSRPC::rpc({ 'uri' => "$js->{'uri'}/worker", 'timeout' => 10 }, $BSXML::worker, "jobid=$js->{'jobid'}");
+      1;
+    };
+    next if $alive;
+
+    my $key = "$arch/$job/$js->{'jobid'}";
+    unless ($before{$key}) {
+      $now{$key} = 1;    # first miss: check again next run
+      next;
+    }
+    eval {
+      BSRPC::rpc({ 'uri' => "$BSConfig::reposerver/jobs/$arch/$job", 'request' => 'POST', 'timeout' => 30 },
+                 undef, 'cmd=idleworker', "workerid=$js->{'workerid'}", "jobid=$js->{'jobid'}");
+    };
+    if ($@) {
+      warn("obs-reap-jobs: could not release $arch/$job: $@");
+      $now{$key} = 1;
+      next;
+    }
+    print "obs-reap-jobs: released $arch/$job (worker $js->{'workerid'} is gone)\n";
+    my $idlename = ($js->{'hostarch'} || $arch) . ":$js->{'workerid'}";
+    $idlename =~ s/\//_/g;
+    unlink("$workersdir/building/$idlename");
+  }
+}
+
+writestr("$suspects.tmp", $suspects, join('', map { "$_\n" } sort keys %now));

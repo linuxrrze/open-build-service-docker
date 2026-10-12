@@ -1,0 +1,5 @@
+# MariaDB Connector/C option file for thinking-sphinx's searchd connection
+# (referenced by thinking_sphinx.yml's connection_options.default_file; merged
+# into the frontend image by CI). See the comment in thinking_sphinx.yml.
+[client]
+ssl-verify-server-cert=0

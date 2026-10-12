@@ -1,0 +1,20 @@
+
+# --- appended by CI (open-build-service/config/options.production.yml) ---
+# CI builds the image's config/options.yml as upstream's options.yml.example
+# followed by this block. YAML keeps the LAST duplicate key, so this
+# `production:` replaces upstream's (which is just `<<: *default`), while every
+# default -- including ones new upstream releases add -- still comes from
+# upstream's `default:` block. List only values that differ from it.
+#
+# proxy_auth_account_page / proxy_auth_register_page (and overrides of the two
+# pages below) come from OBS_PROXY_AUTH_* in .env, applied by
+# config/initializers/zz_container.rb.
+production:
+  <<: *default
+  source_host: backend
+  frontend_host: frontend
+  memcached_host: cache
+  # OIDC login via the traefikoidc reverse proxy (X-username/X-email/...).
+  proxy_auth_mode: :on
+  proxy_auth_login_page: /oauth2/callback
+  proxy_auth_logout_page: /oauth2/logout

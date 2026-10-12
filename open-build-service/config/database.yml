@@ -1,0 +1,19 @@
+---
+# The frontend runs under RAILS_ENV=production (see the image READMEs), so
+# this production: block is the live one. development: is kept only for
+# `docker compose run ... rake dev:bootstrap` and local tinkering.
+production: &db
+  adapter: mysql2
+  database: obs_api_production
+  username: obs_api_production
+  # Read from the container's own env (see .env.sample / docker-compose.yml.sample's
+  # env_file: .env) rather than hardcoding a real password in a tracked file.
+  password: <%= ENV.fetch("MARIADB_PASSWORD", "") %>
+  encoding: utf8mb4
+  collation: utf8mb4_unicode_ci
+  timeout: 15
+  pool: 30
+  host: obs-mariadb
+
+development:
+  <<: *db

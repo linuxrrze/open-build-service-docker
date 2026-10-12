@@ -1,0 +1,108 @@
+#!/bin/bash
+#
+# Production backend start: upstream's contrib/start_development_backend,
+# UNCHANGED (exec'd at the end), plus signing setup, the scheduler manager and
+# the worker sweep below. Takes the same -d/-h/-l options as upstream and
+# passes them through.
+#
+# Schedulers follow OBS's "Architecture Availability" (Admin > Architectures
+# in the web UI): obs-sched-manager watches <schedulers> in
+# /srv/obs/configuration.xml -- which the UI rewrites on every change -- and
+# starts/stops `bs_sched <arch>` to match (also the i586/x86_64 ones upstream
+# always starts). Upstream's SIGTERM trap (`killall bs_sched`) still stops
+# them all on shutdown.
+
+GIT_HOME=/obs
+LOG=
+while getopts "l:d:h:?" opt; do
+  case "$opt" in
+    l) LOG=$OPTARG ;;
+    d) GIT_HOME=$OPTARG ;;
+  esac
+done
+
+# Scheduler manager (see header), in the background.
+/usr/local/bin/obs-sched-manager "$GIT_HOME" "$LOG" &
+
+# Package/repository signing, same layout as upstream's appliance setup
+# (dist/setup-appliance.sh, prepare_obssigner). Configured from .env:
+#   OBS_SIGN=1|0                 enable signing (default 1)
+#   OBS_SIGN_KEY_EMAIL/_NAME     default key identity, also signd's `user:`
+#   OBS_SIGN_KEY_LENGTH/_EXPIRE  used only when the key is first generated
+#   OBS_SIGN_FORCE_PROJECT_KEYS  auto-create a key per project (default 1)
+#   OBS_SIGN_HASH                signature digest: sha256 (default) | sha512 |
+#                                sha1 (the sign tool's own default -- rejected
+#                                by current apt/rpm, don't use)
+# The GnuPG home /srv/obs/gnupg persists with the data dir and stays
+# root:root 0700 (only signd, running as root, may read the private key;
+# obs-entry's ownership fix skips it). The key is generated once, without a
+# passphrase (empty phrases/<user> file), if it doesn't exist yet -- to use
+# your own key, import it into that homedir instead.
+# Upstream's start_development_backend (exec'd below) then sets
+# $sign="/usr/bin/sign" and $gpg_standard_key="/etc/ourkeyfile.asc" itself and
+# starts signd; we provide the key, sign.conf, that keyfile and the rest.
+BS_CFG="$GIT_HOME/src/backend/BSConfig.pm"
+if [ "${OBS_SIGN:-1}" = 1 ]; then
+  GNUPGHOME=/srv/obs/gnupg
+  SIGN_USER=${OBS_SIGN_KEY_EMAIL:-defaultkey@localobs}
+  install -d -m 0700 -o root -g root "$GNUPGHOME" "$GNUPGHOME/phrases"
+  if ! gpg --homedir "$GNUPGHOME" --batch --list-secret-keys "$SIGN_USER" >/dev/null 2>&1; then
+    echo "Generating OBS signing key for $SIGN_USER"
+    gpg --homedir "$GNUPGHOME" --batch --gen-key <<EOF
+Key-Type: RSA
+Key-Length: ${OBS_SIGN_KEY_LENGTH:-4096}
+Subkey-Type: RSA
+Subkey-Length: ${OBS_SIGN_KEY_LENGTH:-4096}
+Name-Real: ${OBS_SIGN_KEY_NAME:-private OBS}
+Name-Email: $SIGN_USER
+Expire-Date: ${OBS_SIGN_KEY_EXPIRE:-0}
+%no-protection
+%commit
+EOF
+  fi
+  [ -e "$GNUPGHOME/phrases/$SIGN_USER" ] || : > "$GNUPGHOME/phrases/$SIGN_USER"
+  gpg --homedir "$GNUPGHOME" --batch --export -a "$SIGN_USER" > /srv/obs/obs-default-gpg.asc
+  chown obsrun:obsrun /srv/obs/obs-default-gpg.asc
+  ln -sf /srv/obs/obs-default-gpg.asc /etc/ourkeyfile.asc
+  cat > /etc/sign.conf <<EOF
+user: $SIGN_USER
+server: 127.0.0.1
+allowuser: obsrun
+allow: 127.0.0.1
+phrases: $GNUPGHOME/phrases
+gnupghome: $GNUPGHOME
+hash: ${OBS_SIGN_HASH:-sha256}
+EOF
+  perl -pi -e 's|^\s*#\s*our \$keyfile\b.*|our \$keyfile = "/srv/obs/obs-default-gpg.asc";|' "$BS_CFG"
+  if [ "${OBS_SIGN_FORCE_PROJECT_KEYS:-1}" = 1 ]; then
+    perl -pi -e 's|^\s*#\s*our \$forceprojectkeys\b.*|our \$forceprojectkeys = 1;|' "$BS_CFG"
+    grep -q '^our \$forceprojectkeys' "$BS_CFG" || echo 'our $forceprojectkeys = 1;' >> "$BS_CFG"
+  fi
+else
+  # Upstream enables $sign unconditionally; drop the line so it has nothing
+  # to enable (bs_signer then passes jobs through unsigned).
+  perl -ni -e 'print unless /our \$sign\s/' "$BS_CFG"
+fi
+
+# Forget unavailable workers, every 5 minutes. Upstream registers each worker
+# as "$HOSTNAME:<n>", so every recreated worker container leaves an entry
+# behind, and 2.10.34 never expires them: a worker killed without a clean exit
+# stays in idle/ until a job dispatch to it fails. A live idle worker rewrites
+# its idle/ file every 5 minutes (bs_worker periodic), so one untouched for
+# 15 minutes is gone. down/dead entries are kept 15 minutes, away/ (worker
+# building for another reposerver) a day. Busy workers (building/ + the job
+# status the monitor shows) are only released by obs-reap-jobs, after the
+# worker failed a liveness check twice.
+(
+  W=/srv/obs/workers
+  while sleep 300; do
+    find "$W/idle" "$W/down" "$W/dead" -type f -mmin +15 -delete 2>/dev/null
+    find "$W/away" -type f -mmin +1440 -delete 2>/dev/null
+    # Jobs still "building" on a worker that's gone (e.g. OBS shut down
+    # mid-build, worker container recreated under a new id): hand them back
+    # after two failed checks -- see /usr/local/bin/obs-reap-jobs.
+    su -s /bin/sh obsrun -c /usr/local/bin/obs-reap-jobs 2>&1 | grep -v ParserDetails.ini
+  done
+) &
+
+exec "$GIT_HOME/contrib/start_development_backend" "$@"

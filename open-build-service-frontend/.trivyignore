@@ -1,0 +1,90 @@
+# Trivy vulnerability-ignore list for the open-build-service-frontend image
+# (used via --ignorefile in .github/workflows/open-build-service-frontend-rebuild.yml).
+#
+# WHY ALL OF THESE ARE ACCEPTED
+# This image bakes the pinned open-build-service 2.10.34 release, which is built
+# against the Rails 5.2.8.1 / Ruby 2.7 gem stack. openSUSE ships exactly these
+# gem versions in its own OBS:Server:2.10 frontend container (the base image this
+# one extends), so the versions are not something we can move independently --
+# bumping any of them would mean forking OBS's src/api and re-resolving the whole
+# Gemfile.lock, which breaks the "track the openSUSE 2.10 line" premise of this
+# image. The CVEs below are therefore structurally unfixable in this image: the
+# fix lives in a newer Rails/Ruby that OBS 2.10 does not ship.
+#
+# The set spans dev/test-only gems (selenium-webdriver, rdoc, uri) and core
+# runtime gems (actionview, activestorage, activesupport, nokogiri, puma, ...).
+# Accepted deliberately after review -- see the commit that added this file
+# (in the original Gitea docker-images repo) for the Trivy report.
+# Re-evaluate when (or if) OBS moves off Rails 5.2 / Ruby 2.7.
+#
+# Format: one vulnerability ID per line (CVE-... or GHSA-...). The gem test-
+# fixture private keys (bunny, capybara, mysql2 spec .pem files) are NOT listed
+# here -- those are Trivy *secret* findings, suppressed via --skip-files in the
+# workflow (an ignorefile only affects vulnerability findings).
+
+# actionview 5.2.8.1
+CVE-2023-23913
+
+# activestorage 5.2.8.1
+CVE-2026-33195
+CVE-2026-33202
+CVE-2026-33174
+CVE-2026-66066
+
+# activesupport 5.2.8.1
+CVE-2026-33176
+
+# addressable 2.6.0
+CVE-2021-32740
+CVE-2026-35611
+
+# bcrypt 3.1.13
+CVE-2026-33306
+
+# bundler 2.1.4
+CVE-2020-36327
+
+# concurrent-ruby 1.1.5
+CVE-2026-54906
+CVE-2026-54904
+
+# dalli 3.2.8
+# Memcached command injection through numeric arguments to incr/decr and
+# fetch_with_lock. Fixed in ~> 3.2.9 / 4.3.4 / 5.0.7 / >= 5.1.1, but the image
+# ships 3.2.8 from the pinned Gemfile.lock -- same "can't move the gem without
+# re-resolving OBS's lockfile" premise as the rest of this file.
+GHSA-6wmv-xq9m-fmp7
+
+# nokogiri 1.15.7
+GHSA-353f-x4gh-cqq8
+CVE-2026-79770
+GHSA-mrxw-mxhj-p664
+
+# puma 4.3.5
+CVE-2022-24790
+CVE-2021-29509
+CVE-2022-23634
+
+# rdoc 6.1.1
+CVE-2021-31799
+
+# rexml 3.2.3.1
+CVE-2024-49761
+
+# rubyzip 2.0.0
+CVE-2026-85396
+
+# sanitize 6.0.0
+CVE-2023-36823
+
+# selenium-webdriver 3.142.6
+CVE-2023-5590
+
+# stringio 0.1.0
+CVE-2024-27280
+
+# uri 0.10.0.2
+CVE-2025-61594
+
+# zlib 1.1.0
+CVE-2026-27820
