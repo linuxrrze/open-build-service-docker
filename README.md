@@ -20,14 +20,6 @@ Images:
 `<owner>` is this repository's owner, lowercased. Deployment instructions
 are in [`open-build-service/README.md`](open-build-service/README.md).
 
-## Origin
-
-Converted from the `open-build-service*` images of a Gitea-hosted
-`docker-images` repo (Gitea Actions, Gitea container registry) to a
-standalone GitHub repo. The image contents, the build logic and the
-change-detection are unchanged; what differs is listed in
-[`.github/workflows/README.md`](.github/workflows/README.md#differences-from-the-gitea-version).
-
 ## GitHub setup (once)
 
 No secrets are needed: the workflows push with the built-in `GITHUB_TOKEN`.
@@ -43,8 +35,8 @@ No secrets are needed: the workflows push with the built-in `GITHUB_TOKEN`.
    the owner's *Packages*, private by default (for a user account; orgs
    follow their default). Make them public, or `docker login ghcr.io` on
    the deployment host with a PAT that has `read:packages`.
-4. Push to `main` (or run a workflow via **Actions → … → Run workflow**). The
-   version files start empty, so the first run of each workflow always builds.
+4. Push to `main` or run a workflow via **Actions → … → Run workflow**.
+   To force the next scheduled run to rebuild, empty the image's version file.
 
 **Scheduled runs and inactivity:** GitHub disables `schedule:` triggers in a
 public repo after 60 days without repository activity. The bot's bump

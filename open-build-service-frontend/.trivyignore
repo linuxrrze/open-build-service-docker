@@ -13,8 +13,7 @@
 #
 # The set spans dev/test-only gems (selenium-webdriver, rdoc, uri) and core
 # runtime gems (actionview, activestorage, activesupport, nokogiri, puma, ...).
-# Accepted deliberately after review -- see the commit that added this file
-# (in the original Gitea docker-images repo) for the Trivy report.
+# Accepted deliberately after review of the Trivy report.
 # Re-evaluate when (or if) OBS moves off Rails 5.2 / Ruby 2.7.
 #
 # Format: one vulnerability ID per line (CVE-... or GHSA-...). The gem test-

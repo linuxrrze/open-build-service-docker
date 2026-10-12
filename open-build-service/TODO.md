@@ -227,9 +227,8 @@ docker compose logs --since 2m frontend 2>&1 | grep -i "influxdb"   # expect emp
 
 ## Fix 3: searchd / thinking-sphinx "TLS/SSL error" (project delete 500s) -- DONE
 
-**Fixed in `bf42426`** (open-build-service: really fix thinking-sphinx TLS error
-on project delete), baked into the frontend image by the 2.10.34 rebuild
-(`640a17b`). **Verified on the host 2026-09-28: project delete works.**
+**Fixed** and baked into the frontend image since the 2.10.34 build.
+**Verified on the host 2026-09-28: project delete works.**
 
 **Symptom:** `DELETE /project/destroy` 500'd with
 `ThinkingSphinx::SphinxError (TLS/SSL error: SSL is required, but the server
@@ -240,7 +239,7 @@ container): the frontend base image (Leap 16.0) ships `libmariadb3` 3.4.9, built
 with `DEFAULT_SSL_VERIFY_SERVER_CERT`. While server-cert verification is on, the
 client *forces* TLS in the handshake (`plugins/auth/my_auth.c`) and errors out
 when the server offers none -- and searchd's mysql41 listener has no TLS.
-- `ssl_mode: disabled` (the first fix, `9ba0825`) is a no-op: mysql2 0.5.2's
+- `ssl_mode: disabled` (the first attempted fix) is a no-op: mysql2 0.5.2's
   `ssl_mode=` only works with MySQL client libraries >= 5.7.3.
 - Option-file keys `ssl-enforce=0` / `ssl=0` / `skip-ssl` are overridden by the
   verification default (probe: all FAIL).
@@ -267,7 +266,6 @@ has only a `production:` key.
   baked at build time. Both workflows rebuild on every push that matches their
   `paths:` (and on a manual run); only the nightly cron skips when the tracked
   upstream state (backend: base digest; frontend: `<release>@<base digest>`)
-  is unchanged. A no-change rebuild doesn't create a bot commit. (Formerly
-  this needed decrementing the version file to force `changed=true`.)
+  is unchanged. A no-change rebuild doesn't create a bot commit.
 - **All container-side probes/verifies must run on the host** (this sandbox has
   no docker daemon).

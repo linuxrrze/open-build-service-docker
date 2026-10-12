@@ -50,23 +50,15 @@ CI's own bump commit and doc edits don't rebuild anything.
 - To verify a workflow change end to end, empty the version file (or run the
   workflow manually) and confirm it builds, scans, pushes and records.
 
-## Differences from the Gitea version
+## Notes
 
-| | Gitea (original) | GitHub (this repo) |
-| --- | --- | --- |
-| Location | `.gitea/workflows/`, `.gitea/scripts/` | `.github/workflows/`, `.github/scripts/` |
-| Registry | `git.linux-ng.de/marcel/<image>` | `ghcr.io/<owner, lowercased>/<image>`, set in a "Set image name" step (ghcr names must be lowercase) |
-| Push credentials | `REGISTRY_USER` / `REGISTRY_PASSWORD` secrets (Gitea PAT) | built-in `GITHUB_TOKEN`; `permissions: contents: write, packages: write` |
-| Package <-> repo link | -- | `org.opencontainers.image.source` label on the build |
-| Bot identity | `gitea-actions` | `github-actions[bot]` |
-| Overlapping runs | not guarded | `concurrency: <workflow>` (queued, not cancelled) |
-| Cron | both 06:00 | backend 06:00, frontend 06:20 (fewer bump-commit races) |
-| `push.paths` | image dirs + workflow | also `.github/scripts/**` (banner/scan changes rebuild) |
-| Version files | last values built for the Gitea registry | start empty, so the first run builds into ghcr.io |
-| Compose image refs | hard-coded registry path | `${OBS_IMAGE_PREFIX}` from `.env` |
-
-Unchanged: change detection, the clone/stage/build steps and Dockerfiles,
-the drift guard, banner and Trivy scripts, tags, and the retry-with-rebase
-record step. A push made with `GITHUB_TOKEN` does not trigger further
-workflow runs on GitHub, so bump commits can't loop even without the
-`paths:` filter.
+- Images go to `ghcr.io/<owner>/<image>`; the owner is lowercased in a
+  "Set image name" step (ghcr.io names must be lowercase). The build adds an
+  `org.opencontainers.image.source` label, which links each package to this
+  repository.
+- Pushes and version-bump commits use the built-in `GITHUB_TOKEN`
+  (`permissions: contents: write, packages: write`); no secrets needed.
+  A push made with `GITHUB_TOKEN` does not trigger further workflow runs, so
+  bump commits can't loop even without the `paths:` filter.
+- `concurrency: <workflow>` queues overlapping runs of the same workflow
+  instead of running them in parallel.
