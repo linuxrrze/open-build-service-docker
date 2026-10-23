@@ -64,7 +64,13 @@ services:
       - -c
       - |
         set -e
-        rm -f tmp/pids/*.pid
+        # Stale pid files survive a stop/start of the same container. searchd's
+        # (log/, thinking-sphinx's default) is the dangerous one: if its PID is
+        # reused by a live process, riddle thinks searchd is running, skips the
+        # exec in ts:start's forked child, which then hits Process.wait(nil)
+        # ("TypeError: no implicit conversion from nil to integer") and foreman
+        # tears the whole frontend down.
+        rm -f tmp/pids/*.pid log/*.sphinx.pid
         # OBS uses the data_migrate gem: schema and data migrations are separate
         # tracks, and schema migration 20170306084558 refuses to run until its
         # paired data migration 20170306084550 is recorded. Running plain
