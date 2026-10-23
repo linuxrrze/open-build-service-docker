@@ -47,6 +47,9 @@ CVE-2020-36327
 CVE-2026-54906
 CVE-2026-54904
 
+# crass 1.0.6
+CVE-2026-61845
+
 # dalli 3.2.8
 # Memcached command injection through numeric arguments to incr/decr and
 # fetch_with_lock. Fixed in ~> 3.2.9 / 4.3.4 / 5.0.7 / >= 5.1.1, but the image
