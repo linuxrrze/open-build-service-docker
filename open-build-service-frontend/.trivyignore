@@ -67,6 +67,11 @@ CVE-2022-24790
 CVE-2021-29509
 CVE-2022-23634
 
+# rack 2.2.23
+# Multipart parser keeps parsed data in its scan buffer (DoS). Fixed in
+# ~> 2.2.25, but 2.2.23 is pinned by the upstream Gemfile.lock.
+GHSA-5v64-555j-wjxm
+
 # rdoc 6.1.1
 CVE-2021-31799
 
