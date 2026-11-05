@@ -21,6 +21,9 @@
 # here -- those are Trivy *secret* findings, suppressed via --skip-files in the
 # workflow (an ignorefile only affects vulnerability findings).
 
+# actionpack 5.2.8.1
+GHSA-wm3x-v3qw-4jh3
+
 # actionview 5.2.8.1
 CVE-2023-23913
 
@@ -29,9 +32,12 @@ CVE-2026-33195
 CVE-2026-33202
 CVE-2026-33174
 CVE-2026-66066
+GHSA-f3w6-w445-fwh9
+GHSA-v924-7rp8-4mxh
 
 # activesupport 5.2.8.1
 CVE-2026-33176
+GHSA-8474-xrp6-wh69
 
 # addressable 2.6.0
 CVE-2021-32740
@@ -49,6 +55,7 @@ CVE-2026-54904
 
 # crass 1.0.6
 CVE-2026-61845
+CVE-2026-61847
 
 # dalli 3.2.8
 # Memcached command injection through numeric arguments to incr/decr and
