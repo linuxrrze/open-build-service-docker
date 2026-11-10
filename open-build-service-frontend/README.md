@@ -31,10 +31,14 @@ The build:
    `OBS_PROXY_AUTH_*` env overrides, `SECRET_KEY_BASE` check), and
    `options.yml` = upstream's `options.yml.example` + our
    `options.production.yml` block. Drops upstream's `spec/` and `test/`
-   suites from the build context (never used at runtime).
+   suites from the build context (never used at runtime) and moves
+   `src/api/vendor/cache` to `gem-cache/` at the context root, so the gem
+   files are only shipped once (in the gem layer).
 4. Builds `open-build-service-frontend/docker/Dockerfile` with the clone as
-   context: `gem install foreman`, then -- as `frontend` -- `bundle install`
-   from just `Gemfile`/`Gemfile.lock`/`vendor/cache` (same flags as upstream's
+   context: applies pending openSUSE security patches (`zypper patch
+   --category security`, as in the backend image), `gem install foreman`,
+   then -- as `frontend` -- `bundle install` from just
+   `Gemfile`/`Gemfile.lock` and `gem-cache/` as `vendor/cache` (same flags as upstream's
    own Dockerfile, without the `test` group), `COPY --chown` of `src/api/`,
    and `rails assets:precompile` under `RAILS_ENV=production` (with a
    build-time dummy `SECRET_KEY_BASE`). Gems come before the source, so a

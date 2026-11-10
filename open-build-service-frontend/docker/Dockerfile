@@ -27,6 +27,20 @@
 FROM registry.opensuse.org/obs/server/2.10/containers/containers/openbuildservice/frontend-base:210
 ARG CONTAINER_USERID
 
+# Pending security patches of the base's own repos (same OBS:Server:2.10 /
+# Leap repos the base was built from, so the runtime stays aligned), as in the
+# backend image -- keeps a fixable OS CVE from failing the Trivy gate between
+# openSUSE's own base rebuilds. Repo metadata and package cache removed in the
+# same layer. `zypper patch` exits 103 after updating the package manager
+# itself (run it again for the rest) and 102 when a patch would want a reboot
+# (meaningless in a container). Runs as root (the base image's user), before
+# USER frontend below.
+RUN zypper -n --gpg-auto-import-keys ref \
+ && rc=0 && { zypper -n patch --category security || rc=$?; } \
+ && if [ "$rc" -eq 103 ]; then rc=0; zypper -n patch --category security || rc=$?; fi \
+ && { [ "$rc" -eq 0 ] || [ "$rc" -eq 102 ]; } \
+ && zypper clean -a
+
 # Process manager, pinned (upstream also installs jshint/brakeman for their own
 # lint/scan CI -- not needed here, omitted to keep the image lean).
 RUN gem install --no-document --no-format-executable foreman -v 0.90.0
@@ -50,8 +64,12 @@ WORKDIR /obs/src/api
 # never loaded in production. NOT `development` -- in 2.10.34 puma (the Procfile's
 # web server) and single_test (required by the Rakefile) are in the
 # :development, :test group.
+# The .gem files come from gem-cache/ at the context root: the workflow moves
+# src/api/vendor/cache there, so the full-source COPY below doesn't ship the
+# same ~27 MB a second time. They land at vendor/cache, where bundler (and
+# upstream's layout) expect them.
 COPY --chown=frontend:users src/api/Gemfile src/api/Gemfile.lock /obs/src/api/
-COPY --chown=frontend:users src/api/vendor/cache/ /obs/src/api/vendor/cache/
+COPY --chown=frontend:users gem-cache/ /obs/src/api/vendor/cache/
 RUN bundle config build.ffi --enable-system-libffi \
  && bundle config build.nokogiri --use-system-libraries \
  && bundle config build.nio4r --with-cflags='-Wno-return-type' \
@@ -62,7 +80,9 @@ RUN bundle config build.ffi --enable-system-libffi \
 # Bake the pinned app source (build context = the release clone; CI has already
 # added this repo's config files to src/api/config/ and dropped the spec/ and
 # test/ suites before building -- see the workflow's merge step; no upstream
-# file is replaced). Overwrites the base image's empty stub.
+# file is replaced). Overwrites the base image's empty stub. vendor/cache isn't
+# in src/api any more (moved to gem-cache/), so the copy from the gem layer
+# above stays as is.
 COPY --chown=frontend:users src/api/ /obs/src/api/
 
 # API-token issuer (see open-build-service/README.md, "API access"). A small

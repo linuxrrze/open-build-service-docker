@@ -166,6 +166,11 @@ jobs:
           # private-key fixture (spec/fixtures/files/cloudupload_secret_key_tests.pem)
           # Trivy's secret scanner would flag.
           rm -rf "$A/spec" "$A/test"
+          # vendor/cache (the .gem files, ~27 MB) is COPYed into the gem
+          # layer before bundle install; moved out of src/api so the later
+          # full-source COPY doesn't ship it again (the Dockerfile COPYs
+          # gem-cache/ back to vendor/cache).
+          mv "$A/vendor/cache" /tmp/open-build-service-src/gem-cache
           echo "merged open-build-service/config overrides into src/api"
 
       - name: Upstream drift guard (obs_sync_configuration.rb / zz_container.rb touch points)
