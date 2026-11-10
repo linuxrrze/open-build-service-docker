@@ -123,4 +123,4 @@ EXPOSE 3000
 # The entrypoint also wraps compose `command:` overrides (they replace CMD
 # only), so the pid cleanup runs whatever the deployment starts.
 ENTRYPOINT ["/usr/local/bin/obs-frontend-entry"]
-CMD["foreman", "start", "-f", "Procfile", "-p", "3000"]
+CMD ["foreman", "start", "-f", "Procfile", "-p", "3000"]
