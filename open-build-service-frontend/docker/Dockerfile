@@ -82,6 +82,9 @@ COPY obs_api_token.rb /usr/local/bin/obs_api_token.rb
 # the script. Staged into the clone root by the workflow's merge step, like
 # obs_api_token.rb.
 COPY --chmod=0755 obs-frontend-entry.sh /usr/local/bin/obs-frontend-entry
+# Start command (CMD below): db:migrate:with_data, wait for the backend, sync
+# configuration.xml, exec foreman. Staged the same way.
+COPY --chmod=0755 obs-frontend-start.sh /usr/local/bin/obs-frontend-start
 
 # Production runtime.
 ENV RAILS_ENV=production \
@@ -118,9 +121,12 @@ RUN mkdir -p tmp log \
 
 EXPOSE 3000
 
-# Foreman runs the Procfile: web (rails server) + delayed_job (async) +
-# clock (scheduled) + search (ts:rebuild). -p 3000 so traefik/rails agree.
-# The entrypoint also wraps compose `command:` overrides (they replace CMD
+# obs-frontend-start migrates, syncs the configuration to the backend, then
+# execs foreman for the Procfile: web (rails server) + delayed_job (async) +
+# clock (scheduled) + search (ts:rebuild), -p 3000 so traefik/rails agree.
+# The frontend compose service sets no `command:`, so image updates bring
+# start-up changes with them; frontend-token overrides CMD with its own.
+# The entrypoint also wraps such `command:` overrides (they replace CMD
 # only), so the pid cleanup runs whatever the deployment starts.
 ENTRYPOINT ["/usr/local/bin/obs-frontend-entry"]
-CMD ["foreman", "start", "-f", "Procfile", "-p", "3000"]
+CMD ["/usr/local/bin/obs-frontend-start"]

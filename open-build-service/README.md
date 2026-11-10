@@ -65,7 +65,7 @@ the images, so there's nothing to back up or `git pull` for it.
     deployments) point `OBS_PROXY_AUTH_ACCOUNT_PAGE` /
     `OBS_PROXY_AUTH_REGISTER_PAGE` at your IdP's self-service account page so
     the "Edit your account" link goes somewhere useful.
- 2. Bring up the stack: `docker compose up -d`. The frontend runs
+ 2. Bring up the stack: `docker compose up -d`. The frontend image runs
     `db:migrate:with_data` on every start (idempotent); on a genuinely fresh
     database that creates the schema. (OBS uses the data_migrate gem, so the
     combined `:with_data` task is required -- running plain `db:migrate` hits
@@ -95,6 +95,17 @@ the images, so there's nothing to back up or `git pull` for it.
     `docker compose run --no-deps --rm frontend bin/rails runner 'puts User.where("login LIKE ?", "%your-username%").pluck(:login).inspect' RAILS_ENV=production`).
      The task is idempotent — it won't duplicate the role if the user is
      already admin.
+
+## Updating
+
+`docker compose pull && docker compose up -d`. Start-up logic lives in the
+images (entrypoints and CMDs), not in `docker-compose.yml`, so updates need no
+edits to your real compose file -- keep it that way: don't give `frontend` or
+`backend` a `command:` (only `worker`, `cache`, `frontend-token` and
+`obs-mariadb` need one). A `command:` copied from an older sample overrides the
+image's CMD and keeps running the old start-up steps; delete it. Still diff
+your file against `docker-compose.yml.sample` now and then for other changes
+(labels, services).
 
 ## API access without OIDC (per-user basic auth)
 
@@ -215,7 +226,7 @@ client + `perl` and an account with project-creation rights on the target
 | `config/database.yml` | yes (merged into the image by CI) | `production:` block (live under `RAILS_ENV=production`); password from `ENV["MARIADB_PASSWORD"]`. |
 | `config/options.production.yml` | yes (appended by CI) | Our `production:` block (backend/frontend/memcached hosts, OIDC proxy auth), appended to upstream's `options.yml.example` to form the image's `options.yml` -- the last duplicate YAML key wins, so all other defaults stay upstream's. |
 | `config/zz_container.rb` | yes (added as an initializer by CI) | Container settings without replacing any upstream file: serve `public/` from Rails (Puma is the web server here), apply `OBS_PROXY_AUTH_*` env overrides to `CONFIG`, and require `SECRET_KEY_BASE` in production (the image ships only a placeholder `config/secret.key` for upstream's `secret_token.rb`). Also stops upstream's worker-status job from re-enabling architectures in *Architecture Availability* (`WorkerStatus#parse_daemon_infos`), so the UI setting stays authoritative. And makes the *Architecture Availability* checkboxes work: upstream's page disables the checkbox before jquery_ujs serializes it, so the click request never carries `available` and every click saved `false`; a missing value now toggles the stored one. |
-| `config/obs_sync_configuration.rb` | yes (added as `script/` by CI) | Run by the frontend on every start (compose command, after the migrations): syncs `.env` settings (`OBS_NAME`, `OBS_URL`, `OBS_ADMIN_EMAIL`, project-key enforcement from `OBS_SIGN*`) into OBS's configuration and writes `/srv/obs/configuration.xml` to the backend. OBS itself only writes that file when an admin saves the configuration page, so a fresh backend data dir would otherwise have none (Origin `obs://build.some.where/...`, no scheduler list). The scheduler architectures come from the UI's Architecture Availability, not from `.env`. |
+| `config/obs_sync_configuration.rb` | yes (added as `script/` by CI) | Run by the frontend on every start (the image's `obs-frontend-start`, after the migrations and once the backend's source server answers): syncs `.env` settings (`OBS_NAME`, `OBS_URL`, `OBS_ADMIN_EMAIL`, project-key enforcement from `OBS_SIGN*`) into OBS's configuration and writes `/srv/obs/configuration.xml` to the backend. OBS itself only writes that file when an admin saves the configuration page, so a fresh backend data dir would otherwise have none (Origin `obs://build.some.where/...`, no scheduler list). The scheduler architectures come from the UI's Architecture Availability, not from `.env`. |
 | `config/thinking_sphinx.yml` | yes (merged into the image by CI) | thinking-sphinx config; upstream ships only the `.example`. Sets `connection_options.default_file` to `no_ssl.cnf` so the `Mysql2` client reaches in-container searchd's no-SSL MySQL-protocol port (9314) -- without it every Sphinx update (e.g. project deletion) 500s with "SSL is required, but the server does not support it". |
 | `config/no_ssl.cnf` | yes (merged into the image by CI) | MariaDB client option file (`ssl-verify-server-cert=0`) for the searchd connection only. The base image's libmariadb3 >= 3.4 verifies server certs by default and, while doing so, forces TLS; mysql2 0.5.2's `ssl_mode` is a no-op on libmariadb, and `ssl-enforce=0`/`ssl=0`/`skip-ssl` are overridden. Disabling verification lets the client fall back to plaintext. Scoped via `default_file` rather than the global `MARIADB_TLS_DISABLE_PEER_VERIFICATION` env var, which would also affect Rails' real DB connection. |
 | `../open-build-service-frontend/docker/obs_api_token.rb` | yes (baked into the frontend image) | The API-token issuer: a small WEBrick service run by the `frontend-token` compose service (see "API access without OIDC" above). Logged-in users open `/_obs_api_token` to issue (shown once, never stored) or revoke their own token via POST; its bcrypt hash is written to the shared htpasswd file that traefik's `obs-api` basicauth reads. Accepts only requests carrying traefik's `X-Obs-Issuer-Secret`. |

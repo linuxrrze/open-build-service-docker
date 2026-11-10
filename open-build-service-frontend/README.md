@@ -48,15 +48,19 @@ touches `open-build-service-frontend/docker/` or `.trivyignore`,
 `open-build-service/config/` or the workflow (and a manual run) always
 rebuilds.
 
-`CMD` is `foreman start -f Procfile -p 3000` (web + delayed_job + clock +
-search). The compose file runs the idempotent `db:migrate:with_data` on start
-(OBS's data_migrate gem needs the combined task -- see the compose file
-comment), then the same foreman command.
+`CMD` is `obs-frontend-start` (`docker/obs-frontend-start.sh`): the
+idempotent `db:migrate:with_data` (OBS's data_migrate gem needs the combined
+task -- see the script), a wait (up to `OBS_BACKEND_WAIT`, default 300 s) for
+the backend's source server on `backend:5352`, the configuration sync
+(`script/obs_sync_configuration.rb`), then `foreman start -f Procfile -p 3000`
+(web + delayed_job + clock + search). The compose `frontend` service sets no
+`command:`, so start-up changes ship with the image.
 
 The `ENTRYPOINT` (`docker/obs-frontend-entry.sh`, staged into the clone by
 the workflow) removes stale pid files (`tmp/pids/*.pid`, searchd's
 `log/*.sphinx.pid`) left by a previous run of the same container, then execs
-the command -- so it also covers the compose file's `command:` override.
+the command -- so it also covers `command:` overrides (`frontend-token`,
+`docker compose run`).
 Without it, the stale searchd pid makes `ts:start`'s forked child think
 searchd is already running: it skips the `exec`, dies in `Process.wait(nil)`
 ("TypeError: no implicit conversion from nil to integer"), and foreman stops

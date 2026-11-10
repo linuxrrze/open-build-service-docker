@@ -20,15 +20,16 @@ services:
 
   backend:
     # Bakes the pinned OBS backend source (src/backend + contrib) into its
-    # /obs, so it no longer needs a host checkout. start_prod_backend seeds
-    # /obs/src/backend/BSConfig.pm from its .template on first run.
+    # /obs, so it no longer needs a host checkout. The obs-entry entrypoint
+    # seeds /obs/src/backend/BSConfig.pm from its .template on every start.
     image: ${OBS_IMAGE_PREFIX:?set OBS_IMAGE_PREFIX in .env}/open-build-service-backend:latest
     container_name: obs-backend
     env_file: .env
     volumes:
       - ./fs/backend/srv/obs:/srv/obs:Z
       - ./fs/logs:/logs
-    command: /obs/contrib/start_prod_backend -d /obs -h backend -l /logs
+    # No `command:` -- the image's CMD (start_prod_backend) is the backend;
+    # repeating it here would pin this file to today's CMD.
     restart: no
     depends_on:
       obs-mariadb:
@@ -53,33 +54,16 @@ services:
 
   frontend:
     # Bakes the pinned OBS frontend (Rails API) into /obs/src/api with
-    # RAILS_ENV=production + precompiled assets. Runs the migrations on start
-    # (idempotent) then foreman (web + delayed_job + clock + search).
+    # RAILS_ENV=production + precompiled assets. On start the image runs the
+    # migrations (idempotent), syncs the configuration to the backend, then
+    # foreman (web + delayed_job + clock + search).
     image: ${OBS_IMAGE_PREFIX:?set OBS_IMAGE_PREFIX in .env}/open-build-service-frontend:latest
     container_name: obs-frontend
     restart: no
     env_file: .env
-    command:
-      - bash
-      - -c
-      - |
-        set -e
-        # (Stale pid files from a previous run of this container -- searchd's
-        # would crash the `search` process -- are removed by the image's
-        # obs-frontend-entry entrypoint before this command runs.)
-        # OBS uses the data_migrate gem: schema and data migrations are separate
-        # tracks, and schema migration 20170306084558 refuses to run until its
-        # paired data migration 20170306084550 is recorded. Running plain
-        # `db:migrate` then `data:migrate` separately hits that guard, so use the
-        # combined task, which runs both in version order.
-        RAILS_ENV=production bin/rails db:migrate:with_data
-        # Write the instance configuration (name, scheduler architectures
-        # from the UI's Architecture Availability, ...) to the backend's
-        # configuration.xml -- OBS
-        # itself only does that when an admin saves the configuration page.
-        RAILS_ENV=production bin/rails runner script/obs_sync_configuration.rb \
-          || echo "WARNING: could not write configuration.xml to the backend"
-        exec foreman start -f Procfile -p 3000
+    # No `command:` -- the image's CMD (obs-frontend-start) runs the
+    # migrations, waits for the backend, syncs configuration.xml and starts
+    # foreman, so start-up changes arrive with `docker compose pull`.
     labels:
       - "traefik.enable=true"
       # The `obs` router serves the web UI on the web host. It EXCLUDES the
