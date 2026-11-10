@@ -75,6 +75,14 @@ COPY --chown=frontend:users src/api/ /obs/src/api/
 # gem; webrick is a Ruby 2.7 default gem), so it's just a plain script.
 COPY obs_api_token.rb /usr/local/bin/obs_api_token.rb
 
+# Runtime entrypoint: removes stale pid files (tmp/pids/, searchd's
+# log/*.sphinx.pid) left in the writable layer by a previous run of the same
+# container, then execs the command. Without it a container stop/start crashes
+# the Procfile's `search` process and foreman takes the frontend down -- see
+# the script. Staged into the clone root by the workflow's merge step, like
+# obs_api_token.rb.
+COPY --chmod=0755 obs-frontend-entry.sh /usr/local/bin/obs-frontend-entry
+
 # Production runtime.
 ENV RAILS_ENV=production \
     RAILS_LOG_TO_STDOUT=1
@@ -112,4 +120,7 @@ EXPOSE 3000
 
 # Foreman runs the Procfile: web (rails server) + delayed_job (async) +
 # clock (scheduled) + search (ts:rebuild). -p 3000 so traefik/rails agree.
-CMD ["foreman", "start", "-f", "Procfile", "-p", "3000"]
+# The entrypoint also wraps compose `command:` overrides (they replace CMD
+# only), so the pid cleanup runs whatever the deployment starts.
+ENTRYPOINT ["/usr/local/bin/obs-frontend-entry"]
+CMD["foreman", "start", "-f", "Procfile", "-p", "3000"]

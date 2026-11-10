@@ -53,7 +53,16 @@ search). The compose file runs the idempotent `db:migrate:with_data` on start
 (OBS's data_migrate gem needs the combined task -- see the compose file
 comment), then the same foreman command.
 
-There is no custom `ENTRYPOINT`. OBS loads `options.yml` with a plain
+The `ENTRYPOINT` (`docker/obs-frontend-entry.sh`, staged into the clone by
+the workflow) removes stale pid files (`tmp/pids/*.pid`, searchd's
+`log/*.sphinx.pid`) left by a previous run of the same container, then execs
+the command -- so it also covers the compose file's `command:` override.
+Without it, the stale searchd pid makes `ts:start`'s forked child think
+searchd is already running: it skips the `exec`, dies in `Process.wait(nil)`
+("TypeError: no implicit conversion from nil to integer"), and foreman stops
+the whole frontend. See the script for why the PID reliably matches.
+
+There is no other startup logic in the image. OBS loads `options.yml` with a plain
 `YAML.load_file` (no ERB) into the `CONFIG` hash *before* the initializers run,
 so `zz_container.rb` applies the `OBS_PROXY_AUTH_*` env overrides to `CONFIG`
 directly. Upstream's `secret_token.rb` requires a `config/secret.key` file; the

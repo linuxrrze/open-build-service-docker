@@ -20,7 +20,7 @@ rebuilds the image whose inputs changed:
    image inputs (or a manual run) always rebuilds.
 3. **Clone** that release tag of `openSUSE/open-build-service` into `/tmp`,
    **stage** this repo's files into it (backend: start script + helper
-   scripts; frontend: Rails config overrides + token issuer, then an
+   scripts; frontend: Rails config overrides + token issuer + entrypoint, then an
    **upstream drift guard** that fails if the upstream code our overrides
    patch has changed), and **build** with our Dockerfile and the clone as
    context.

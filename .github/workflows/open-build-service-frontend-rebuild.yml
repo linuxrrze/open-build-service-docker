@@ -154,6 +154,9 @@ jobs:
           # is the clone root (not our repo), so copy it there for the
           # Dockerfile's `COPY obs_api_token.rb` to find.
           cp open-build-service-frontend/docker/obs_api_token.rb /tmp/open-build-service-src/obs_api_token.rb
+          # The runtime entrypoint (stale pid-file cleanup), likewise for the
+          # Dockerfile's `COPY obs-frontend-entry.sh`.
+          cp open-build-service-frontend/docker/obs-frontend-entry.sh /tmp/open-build-service-src/obs-frontend-entry.sh
           # Upstream's test suites, never used at runtime (the Procfile,
           # db:migrate and assets:precompile don't touch them). Dropped from
           # the build context rather than `rm`ed in the Dockerfile, so they
